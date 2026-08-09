@@ -4,6 +4,7 @@
 * https://www.youtube.com/watch?v=-1ZhCgaIPOk Impariamo il C, lezione 25: l'interprete Toy Forth (parte 3)
 * https://www.youtube.com/watch?v=oMj3N6jYIUU Impariamo il C, lezione 26: Toy Forth, nei meandri della exec() (parte 4)
 * https://www.youtube.com/watch?v=C4AHEK3fSjg Impariamo il C, lezione 27: Toy Forth, la registrazione delle funzioni (parte 5)
+* https://www.youtube.com/watch?v=nHzlRqPnlrE Impariamo il C, lezione 29: ToyForth, esecuzione del primo semplice programma
 */
 
 #include <stdio.h>
@@ -13,6 +14,9 @@
 #include <string.h>
 #include <assert.h>
 
+#define TF_OK 0
+#define TF_ERR 1
+
 /* === DATA STRUCTURES === */
 
 #define TFOBJ_TYPE_INT 0
@@ -20,6 +24,7 @@
 #define TFOBJ_TYPE_BOOL 2
 #define TFOBJ_TYPE_LIST 3
 #define TFOBJ_TYPE_SYMBOL 4
+#define TFOBJ_TYPE_ALL 255 // used by listPop
 
 
 typedef struct tfobj {
@@ -175,6 +180,50 @@ void listPush(tfobj *l, tfobj *ele) {
     l->list.len++;
 }
 
+/* Function table */
+
+typedef struct tfctx tfctx;
+
+typedef struct FunctionTableEntry {
+    tfobj *name;
+    int (*callback) (struct tfctx *ctx, char *name);
+    tfobj *user_func;
+} tffuncentry;
+
+struct FunctionTable {
+    tffuncentry **func_table;
+    size_t func_count;
+};
+
+typedef struct tfctx {
+    tfobj *stack;
+    struct FunctionTable functable;
+} tfctx;
+
+
+
+tfobj *listPopType(tfctx *ctx, int type){
+    tfobj *stack = ctx->stack;
+    if(stack->list.len == 0) return NULL;
+    tfobj *to_pop = stack->list.ele[stack->list.len-1];
+    if(type != TFOBJ_TYPE_ALL && to_pop->type != type) return NULL;
+    
+    stack->list.len--;
+    if(stack->list.len == 0){
+        free(stack->list.ele);
+        stack->list.ele = NULL;
+    } else {
+        stack->list.ele = xrealloc(stack->list.ele, sizeof(tfobj*) * (stack->list.len));
+    }
+    return to_pop;
+}
+
+
+
+tfobj *listPop(tfctx *ctx){
+    return listPopType(ctx, TFOBJ_TYPE_ALL);
+}
+
 /* === TURN PROGRAM INTO TOY FORTH LIST === */
 
 void parserSkipSpaces(tfparser *parser){
@@ -290,28 +339,7 @@ void printObject(tfobj *o){
 
 /* === CONTEXT === */
 
-typedef struct tfctx tfctx;
 
-
-
-/* Function table */
-struct tfctx;
-
-typedef struct FunctionTableEntry {
-    tfobj *name;
-    void (*callback) (struct tfctx *ctx, tfobj *name);
-    tfobj *user_func;
-} tffuncentry;
-
-struct FunctionTable {
-    tffuncentry **func_table;
-    size_t func_count;
-};
-
-typedef struct tfctx {
-    tfobj *stack;
-    struct FunctionTable functable;
-} tfctx;
 
 
 tffuncentry *registerFunction(tfctx *ctx, tfobj *name){
@@ -327,31 +355,11 @@ tffuncentry *registerFunction(tfctx *ctx, tfobj *name){
 }
 
 
-/* === BASIC FUNCTIONS === */
-
-void basicMathFunction(tfctx *ctx, tfobj *name){
-    if(ctxCheckStackMinLen(ctx, 2)) return;
-    tfobj *b = ctxStackPop(ctx, TFOBJ_TYPE_INT);
-    tfobj *a = ctxStackPop(ctx, 0, TFOBJ_TYPE_INT);    
-    if(a == NULL || b == NULL) return;
-
-    int result;
-
-    switch(ctx->str.ptr[0]){
-        case '+': result = a->i + b->i; break;
-        case '-': result = a->i - b->i; break;
-        case '*': result = a->i * b->i; break;
-        case '/': result = a->i / b->i; break;
-        case '%': result = a->i % b->i; break;
-    }
-
-    ctxStackPush(ctx, createIntObject(result));
-}
 
 
 tffuncentry *getFunctionByName(tfctx *ctx, tfobj *name);
 
-int registerCFunction(tfctx *ctx, char *name, void (*callback) (tfctx *ctx, tfobj *name)){
+void registerCFunction(tfctx *ctx, char *name, int (*callback) (tfctx *ctx, char *name)){
     tfobj *oname = createStringObject(name, strlen(name));
     tffuncentry *fe = getFunctionByName(ctx, oname);
     if(fe){
@@ -365,8 +373,7 @@ int registerCFunction(tfctx *ctx, char *name, void (*callback) (tfctx *ctx, tfob
         fe->callback = callback;
     }
 
-    release(oname);
-    
+    release(oname);    
 }
 
 tffuncentry *getFunctionByName(tfctx *ctx, tfobj *name) {
@@ -379,12 +386,18 @@ tffuncentry *getFunctionByName(tfctx *ctx, tfobj *name) {
     return NULL;
 }
 
+int basicMathFunction(tfctx *ctx, char *name);
+
 tfctx *createContext(void){
     tfctx *ctx = xmalloc(sizeof(*ctx));
     ctx->stack = createListObject();
     ctx->functable.func_table = NULL;
     ctx->functable.func_count = 0;
+    registerCFunction(ctx, "+", basicMathFunction);
+    registerCFunction(ctx, "-", basicMathFunction);
     registerCFunction(ctx, "*", basicMathFunction);
+    registerCFunction(ctx, "/", basicMathFunction);
+    registerCFunction(ctx, "%", basicMathFunction);
     
     return ctx;
 }
@@ -396,27 +409,84 @@ tfctx *createContext(void){
 int  callSymbol(tfctx *ctx, tfobj *word){
     tffuncentry *fe = getFunctionByName(ctx, word);
 
-    if(fe == NULL) return 1;
-    return 0;
+    if(fe == NULL) return TF_ERR;
+    if(fe->user_func){
+        // TODO
+        return TF_ERR;
+    } else {
+        return fe->callback(ctx, fe->name->str.ptr);
+    }
 }
 
+
+/* === BASIC FUNCTIONS === */
+
+int ctxCheckStackMinLen(tfctx *ctx, size_t min){
+    return ctx->stack->list.len < min ? TF_ERR : TF_OK;
+}
+
+tfobj *ctxStackPop(tfctx *ctx, int type){
+    return listPopType(ctx, type);
+}
+
+
+void ctxStackPush(tfctx *ctx, tfobj *obj){
+    listPush(ctx->stack, obj);
+}
+
+int basicMathFunction(tfctx *ctx, char *name){
+    if(ctxCheckStackMinLen(ctx, 2)) return TF_ERR;
+
+    tfobj *b = ctxStackPop(ctx, TFOBJ_TYPE_INT);
+    if(b == NULL) return TF_ERR;
+    tfobj *a = ctxStackPop(ctx, TFOBJ_TYPE_INT);    
+    if(a == NULL) {
+        ctxStackPush(ctx, b);
+        return TF_ERR;
+    }
+
+
+    int result;
+
+    switch(name[0]){
+        case '+': result = a->i + b->i; break;
+        case '-': result = a->i - b->i; break;
+        case '*': result = a->i * b->i; break;
+        case '/': result = a->i / b->i; break;
+        case '%': result = a->i % b->i; break;
+    }
+
+    release(a);
+    release(b);
+
+    ctxStackPush(ctx, createIntObject(result));
+
+    return TF_OK;
+}
+
+
 /* execute the toy forth program stored into the list 'prg' */
-void exec(tfctx *ctx, tfobj *prg) {
+int exec(tfctx *ctx, tfobj *prg) {
     assert(prg->type == TFOBJ_TYPE_LIST);
 
     for(size_t j=0; j<prg->list.len; j++){
         tfobj *word = prg->list.ele[j];
         switch(word->type){
             case TFOBJ_TYPE_SYMBOL:
-                callSymbol(ctx, word);
+                if (callSymbol(ctx, word) == TF_ERR){
+                    printf("runtime error\n");
+                    return TF_ERR;
+                }
                 break;        
             default:
-                listPush(ctx->stack, word);
+                ctxStackPush(ctx, word);
                 retain(word);
                 break;
         }
     }
+    return TF_OK;
 }
+
 
 /* === MAIN === */
 
