@@ -3,6 +3,7 @@
 * https://www.youtube.com/watch?v=-QxrmHo-V7Y Impariamo il C, lezione 24: l'interprete Toy Forth (parte 2)
 * https://www.youtube.com/watch?v=-1ZhCgaIPOk Impariamo il C, lezione 25: l'interprete Toy Forth (parte 3)
 * https://www.youtube.com/watch?v=oMj3N6jYIUU Impariamo il C, lezione 26: Toy Forth, nei meandri della exec() (parte 4)
+* https://www.youtube.com/watch?v=C4AHEK3fSjg Impariamo il C, lezione 27: Toy Forth, la registrazione delle funzioni (parte 5)
 */
 
 #include <stdio.h>
@@ -91,20 +92,8 @@ tfobj *createBoolObject(int i){
     return o;
 }
 
-tfobj *createStringObject(char *string, size_t len){
-    tfobj *o = createObject(TFOBJ_TYPE_STR);
-    o->str.ptr = xmalloc(len+1);
-    o->str.len = len;
-    memcpy( o->str.ptr, string, len);
-    o->str.ptr[len] = '\0';
-    return o;
-}
 
-tfobj *createSymbolObject(char *s, size_t len){
-    tfobj *o = createStringObject(s, len);
-    o->type = TFOBJ_TYPE_SYMBOL; 
-    return o;
-}
+
 
 void release(tfobj *o);
 
@@ -134,6 +123,39 @@ void release(tfobj *o){
     assert(o->refcount > 0);
     o->refcount--;
     if(o->refcount == 0) freeObject(o);
+}
+
+/* === STRING OBJECT === */
+
+tfobj *createStringObject(char *string, size_t len){
+    tfobj *o = createObject(TFOBJ_TYPE_STR);
+    o->str.ptr = xmalloc(len+1);
+    o->str.len = len;
+    memcpy( o->str.ptr, string, len);
+    o->str.ptr[len] = '\0';
+    return o;
+}
+
+
+tfobj *createSymbolObject(char *s, size_t len){
+    tfobj *o = createStringObject(s, len);
+    o->type = TFOBJ_TYPE_SYMBOL; 
+    return o;
+}
+
+int compareStringObject(tfobj *a, tfobj *b){
+    size_t minlen = a->str.len < b->str.len ? a->str.len : b->str.len;
+    int cmp = memcmp(a->str.ptr, b->str.ptr, minlen);
+
+    if(cmp == 0){
+        if(a->str.len == b->str.len) return 0;
+        if(a->str.len > b->str.len) return 1;
+        else return -1;
+    } else {
+       if(cmp < 0) return -1;
+       else return 1;
+    }
+
 }
 
 /* === LIST OBJECT === */
@@ -273,15 +295,16 @@ typedef struct tfctx tfctx;
 
 
 /* Function table */
+struct tfctx;
 
-struct FunctionTableEntry {
+typedef struct FunctionTableEntry {
     tfobj *name;
-    void (*callback) (tfctx *ctx, tfobj *name);
-    tfobj *user_list;
-};
+    void (*callback) (struct tfctx *ctx, tfobj *name);
+    tfobj *user_func;
+} tffuncentry;
 
 struct FunctionTable {
-    struct FunctionTableEntry **func_table;
+    tffuncentry **func_table;
     size_t func_count;
 };
 
@@ -290,19 +313,91 @@ typedef struct tfctx {
     struct FunctionTable functable;
 } tfctx;
 
+
+tffuncentry *registerFunction(tfctx *ctx, tfobj *name){
+    ctx->functable.func_table = xrealloc(ctx->functable.func_table, sizeof(tffuncentry*) * (ctx->functable.func_count + 1));
+    tffuncentry *fe = xmalloc(sizeof(tffuncentry));
+    ctx->functable.func_table[ctx->functable.func_count] = fe;
+    ctx->functable.func_count++;
+    fe->name = name;
+    retain(name);
+    fe->callback = NULL;
+    fe->user_func = NULL;
+    return fe;
+}
+
+
+/* === BASIC FUNCTIONS === */
+
+void basicMathFunction(tfctx *ctx, tfobj *name){
+    if(ctxCheckStackMinLen(ctx, 2)) return;
+    tfobj *b = ctxStackPop(ctx, TFOBJ_TYPE_INT);
+    tfobj *a = ctxStackPop(ctx, 0, TFOBJ_TYPE_INT);    
+    if(a == NULL || b == NULL) return;
+
+    int result;
+
+    switch(ctx->str.ptr[0]){
+        case '+': result = a->i + b->i; break;
+        case '-': result = a->i - b->i; break;
+        case '*': result = a->i * b->i; break;
+        case '/': result = a->i / b->i; break;
+        case '%': result = a->i % b->i; break;
+    }
+
+    ctxStackPush(ctx, createIntObject(result));
+}
+
+
+tffuncentry *getFunctionByName(tfctx *ctx, tfobj *name);
+
+int registerCFunction(tfctx *ctx, char *name, void (*callback) (tfctx *ctx, tfobj *name)){
+    tfobj *oname = createStringObject(name, strlen(name));
+    tffuncentry *fe = getFunctionByName(ctx, oname);
+    if(fe){
+        if(fe->user_func){
+            release(fe->user_func);
+            fe->user_func = NULL;
+        }
+        fe->callback = callback;
+    }else {
+        fe = registerFunction(ctx, oname);
+        fe->callback = callback;
+    }
+
+    release(oname);
+    
+}
+
+tffuncentry *getFunctionByName(tfctx *ctx, tfobj *name) {
+    for(size_t j=0; j< ctx->functable.func_count; j++){
+        tffuncentry *fe = ctx->functable.func_table[j];
+
+        if(compareStringObject(fe->name, name) == 0) 
+            return fe;
+    }
+    return NULL;
+}
+
 tfctx *createContext(void){
     tfctx *ctx = xmalloc(sizeof(*ctx));
     ctx->stack = createListObject();
     ctx->functable.func_table = NULL;
     ctx->functable.func_count = 0;
-    //registerFunction(ctx, "*", basicMathFunction);
+    registerCFunction(ctx, "*", basicMathFunction);
     
     return ctx;
 }
 
-/* solve the function associated with the symbol named 'word' */
-void callSymbol(tfctx *ctx, tfobj *word){
 
+
+/* solve the function associated with the symbol named 'word'
+ * return 0 if it matches some functions, otherwise returns 1 */
+int  callSymbol(tfctx *ctx, tfobj *word){
+    tffuncentry *fe = getFunctionByName(ctx, word);
+
+    if(fe == NULL) return 1;
+    return 0;
 }
 
 /* execute the toy forth program stored into the list 'prg' */
